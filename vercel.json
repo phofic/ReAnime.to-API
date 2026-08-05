@@ -1,0 +1,14 @@
+{
+  "builds": [
+    {
+      "src": "reanime.py",
+      "use": "@vercel/python"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "reanime.py"
+    }
+  ]
+}
