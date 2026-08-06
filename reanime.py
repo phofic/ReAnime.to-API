@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import re
+import random
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional
@@ -13,8 +14,31 @@ from fastapi.middleware.cors import CORSMiddleware
 
 BASE = "https://reanime.to"
 FLIX = "https://flixcloud.cc"
-_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-HEADERS = {"User-Agent": _UA, "Accept": "application/json, */*"}
+
+# ---- NEW: list of realistic User-Agents ----
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0",
+]
+
+# ---- Base headers (without User-Agent, we'll set it per request) ----
+BASE_HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "DNT": "1",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+    "Cache-Control": "max-age=0",
+    "Origin": BASE,
+}
+
 _DECRYPT_MJS = str(Path(__file__).parent / "decrypt.mjs")
 
 _client: Optional[httpx.AsyncClient] = None
@@ -27,8 +51,8 @@ async def lifespan(_app):
         http2=True,
         timeout=httpx.Timeout(20.0),
         limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
-        headers=HEADERS,
         follow_redirects=True,
+        # Do not set global headers here; we'll pass per request
     )
     yield
     await _client.aclose()
@@ -38,15 +62,57 @@ app = FastAPI(title="ReAnime Scraper", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
+# ---- NEW _get function with rotating headers and retry ----
 async def _get(path: str, params: dict = None, base: str = BASE) -> Any:
-    r = await _client.get(f"{base}{path}", params=params)
-    if r.status_code == 404:
-        raise HTTPException(404, detail="Not found")
-    if not r.is_success:
-        raise HTTPException(r.status_code, detail=r.text[:300])
-    return r.json()
+    """
+    Perform a GET request with rotating User-Agent and browser-like headers.
+    Retry up to 2 times if we get a 403 (forbidden).
+    """
+    for attempt in range(3):  # try up to 3 times
+        # Choose a random User-Agent
+        user_agent = random.choice(USER_AGENTS)
+        # Choose a random Referer (to mimic different entry points)
+        referer = random.choice([
+            f"{base}/",
+            f"{base}/search",
+            f"{base}/home",
+            "https://www.google.com/",
+            "https://www.bing.com/",
+        ])
+
+        headers = {
+            **BASE_HEADERS,
+            "User-Agent": user_agent,
+            "Referer": referer,
+            "Origin": base,
+        }
+
+        # Add a small delay between retries to avoid rate limiting
+        if attempt > 0:
+            await asyncio.sleep(random.uniform(0.5, 1.5))
+
+        r = await _client.get(f"{base}{path}", params=params, headers=headers)
+
+        if r.status_code == 403:
+            # If this was the last attempt, raise an error
+            if attempt == 2:
+                raise HTTPException(403, detail="Access denied – try again later")
+            # Otherwise, continue to next attempt with new headers
+            continue
+
+        if r.status_code == 404:
+            raise HTTPException(404, detail="Not found")
+
+        if not r.is_success:
+            raise HTTPException(r.status_code, detail=r.text[:300])
+
+        return r.json()
+
+    # Should never reach here
+    raise HTTPException(500, detail="All retry attempts failed")
 
 
+# ---- Everything below remains exactly as in your original ----
 def _anilist_from_anime(anime: dict) -> Optional[int]:
     if not anime:
         return None
@@ -78,7 +144,15 @@ async def _decrypt_embed(html: bytes) -> dict:
 
 
 async def get_stream_url(access_id: str, v: int = 2) -> dict:
-    r = await _client.get(f"{FLIX}/e/{access_id}?v={v}", headers={**HEADERS, "Referer": f"{BASE}/"})
+    # For stream endpoints, we also need to pass proper headers.
+    # Use a random User-Agent here as well.
+    headers = {
+        **BASE_HEADERS,
+        "User-Agent": random.choice(USER_AGENTS),
+        "Referer": f"{BASE}/",
+        "Origin": BASE,
+    }
+    r = await _client.get(f"{FLIX}/e/{access_id}?v={v}", headers=headers)
     if not r.is_success:
         raise HTTPException(r.status_code, detail=f"Embed fetch failed: {r.status_code}")
     return await _decrypt_embed(r.content)
