@@ -1,128 +1,221 @@
-#!/usr/bin/env node
-// Polyfill for fetch if Node.js version < 18
-if (typeof fetch === 'undefined') {
-  const module = await import('node-fetch');
-  globalThis.fetch = module.default;
-}
+#!/usr/bin/env python3
+import asyncio
+import json
+import os
+import re
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any, Optional
 
-import crypto from "node:crypto";
-import { readFileSync } from "node:fs";
+import httpx
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 
-function sha256hex(s) {
-  return crypto.createHash("sha256").update(s).digest("hex");
-}
+BASE = "https://reanime.to"
+FLIX = "https://flixcloud.cc"
+_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+HEADERS = {"User-Agent": _UA, "Accept": "application/json, */*"}
+_DECRYPT_MJS = str(Path(__file__).parent / "decrypt.mjs")
 
-function rt(b64) {
-  return Buffer.from(b64, "base64");
-}
+_client: Optional[httpx.AsyncClient] = None
 
-async function fetchJson(url, headers = {}) {
-  const r = await fetch(url, {
-    headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", ...headers },
-  });
-  if (!r.ok) throw new Error(`HTTP ${r.status} from ${url}`);
-  return r.json();
-}
 
-function le(seed) {
-  let e = seed;
-  for (let i = 0; i < 3; i++) e = sha256hex(e + i);
-  let l = e;
-  for (let i = 0; i < 3; i++) l = sha256hex(l + i);
-  return {
-    keyField:      "kf_"  + e.substring(8,  16),
-    ivField:       "ivf_" + e.substring(16, 24),
-    containerName: "cd_"  + e.substring(24, 32),
-    arrayName:     "ad_"  + e.substring(32, 40),
-    objectName:    "od_"  + e.substring(40, 48),
-    tokenField:    e.substring(48, 64) + "_" + e.substring(56, 64),
-    keyFrag2Field: l.substring(0, 16)  + "_" + l.substring(16, 24),
-  };
-}
+@asynccontextmanager
+async def lifespan(_app):
+    global _client
+    _client = httpx.AsyncClient(
+        http2=True,
+        timeout=httpx.Timeout(20.0),
+        limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+        headers=HEADERS,
+        follow_redirects=True,
+    )
+    yield
+    await _client.aclose()
 
-async function runWasm(wasmB64, frag1, kf2, T_bytes, seedInt) {
-  const { instance } = await WebAssembly.instantiate(rt(wasmB64));
-  const { _s, _r, memory } = instance.exports;
-  const h = new Uint8Array(memory.buffer);
-  const len = frag1.length;
-  const [y, v, T, out] = [1000, 1000 + len, 1000 + 2 * len, 1000 + 3 * len];
-  h.set(frag1, y);
-  h.set(kf2, v);
-  h.set(T_bytes, T);
-  _s(seedInt);
-  _r(y, v, T, out, len);
-  return Buffer.from(h.subarray(out, out + len));
-}
 
-function extractSsrObj(html) {
-  const m = html.match(/\{type:"data",data:(\{)/);
-  if (!m) throw new Error("SSR data block not found");
-  let depth = 0;
-  const start = html.indexOf("{", m.index + m[0].length - 1);
-  for (let i = start; i < html.length; i++) {
-    if (html[i] === "{") depth++;
-    else if (html[i] === "}") {
-      if (--depth === 0) return html.slice(start, i + 1);
+app = FastAPI(title="ReAnime Scraper", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+async def _get(path: str, params: dict = None, base: str = BASE) -> Any:
+    r = await _client.get(f"{base}{path}", params=params)
+    if r.status_code == 404:
+        raise HTTPException(404, detail="Not found")
+    if not r.is_success:
+        raise HTTPException(r.status_code, detail=r.text[:300])
+    return r.json()
+
+
+def _anilist_from_anime(anime: dict) -> Optional[int]:
+    if not anime:
+        return None
+    if anime.get("anilist"):
+        return int(anime["anilist"])
+    for key in ("extra_large", "large", "medium"):
+        url = (anime.get("cover_image") or {}).get(key, "")
+        m = re.search(r"/bx(\d+)-", url)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+async def _decrypt_embed(html: bytes) -> dict:
+    proc = await asyncio.create_subprocess_exec(
+        "node", _DECRYPT_MJS, "-",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(input=html), timeout=20.0)
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise HTTPException(504, detail="Decrypt subprocess timed out")
+    if proc.returncode != 0:
+        raise HTTPException(502, detail=f"Decrypt error: {stderr.decode()[:300]}")
+    return json.loads(stdout)
+
+
+async def get_stream_url(access_id: str, v: int = 2) -> dict:
+    r = await _client.get(f"{FLIX}/e/{access_id}?v={v}", headers={**HEADERS, "Referer": f"{BASE}/"})
+    if not r.is_success:
+        raise HTTPException(r.status_code, detail=f"Embed fetch failed: {r.status_code}")
+    return await _decrypt_embed(r.content)
+
+
+async def _servers(slug: str, ep: int, anilist_id: Optional[int] = None) -> dict:
+    watch = await _get(f"/api/watch/{slug}/{ep}")
+    aid = anilist_id or _anilist_from_anime(watch.get("anime"))
+
+    flix: dict = {}
+    if aid:
+        try:
+            flix = await _get(f"/api/flix/{aid}/{ep}")
+        except HTTPException:
+            pass
+
+    links = list(watch.get("episode_links") or [])
+    if flix.get("success") and flix.get("servers"):
+        seen = {s.get("$id") for s in links}
+        for s in flix["servers"]:
+            if s.get("$id") not in seen:
+                links.append(s)
+
+    _order = {"HD-2": 0, "HD-1": 1}
+    _sort = lambda lst: sorted(lst, key=lambda s: _order.get(s.get("serverName", ""), 9))
+
+    return {
+        "sub":         _sort([s for s in links if s.get("dataType") in ("sub", "s-sub")]),
+        "dub":         _sort([s for s in links if s.get("dataType") in ("dub", "s-dub")]),
+        "anime":       watch.get("anime"),
+        "current":     watch.get("current"),
+        "duration":    watch.get("duration"),
+        "intro_start": watch.get("intro_start"),
+        "intro_end":   watch.get("intro_end"),
+        "outro_start": watch.get("outro_start"),
+        "outro_end":   watch.get("outro_end"),
+        "anilist_id":  aid,
     }
-  }
-  throw new Error("SSR brace matching failed");
-}
 
-async function main() {
-  let html;
-  const arg = process.argv[2] ?? "-";
-  if (arg === "-") {
-    const chunks = [];
-    for await (const chunk of process.stdin) chunks.push(chunk);
-    html = Buffer.concat(chunks).toString();
-  } else {
-    html = readFileSync(arg, "utf8");
-  }
 
-  const data   = eval("(" + extractSsrObj(html) + ")");
-  const seed   = data.obfuscation_seed;
-  const fields = le(seed);
-  const ocd    = data.obfuscated_crypto_data;
-  const obj    = ocd[fields.containerName][fields.arrayName][0][fields.objectName];
-  const frag1  = rt(obj[fields.keyField]);
-  const iv     = rt(obj[fields.ivField]);
-  const kf2    = rt(data[fields.keyFrag2Field]);
-  const token  = data[fields.tokenField];
+@app.get("/")
+async def root():
+    return {
+        "status": "ok",
+        "endpoints": {
+            "search":          "GET /search?q=...&limit=20",
+            "home":            "GET /home?limit=20",
+            "top":             "GET /top?period=week&limit=20",
+            "schedule":        "GET /schedule",
+            "info":            "GET /info/{slug}",
+            "episodes":        "GET /episodes/{slug}",
+            "servers":         "GET /servers/{slug}/{episode}[?anilist_id=...]",
+            "stream":          "GET /stream/{access_id}[?v=2]",
+            "stream_link":     "GET /stream/from-link?link={flixcloud_url}",
+            "thumbnails":      "GET /thumbnails/{anilist_id}",
+            "recommendations": "GET /recommendations/{slug}",
+        },
+    }
 
-  if (!token) throw new Error("Token field missing from embed data");
 
-  const tokData = await fetchJson(`https://flixcloud.cc/api/m3u8/${token}`, { Referer: "https://reanime.to/" });
-  const vidKey  = sha256hex(token + "vid").substring(0, 10);
-  const keyKey  = sha256hex(token + "key").substring(0, 10);
-  const v_bytes = rt(tokData[vidKey]);
-  const T_bytes = rt(tokData[keyKey]);
+@app.get("/search")
+async def search(
+    q: str = Query(..., min_length=1),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    return await _get("/api/search", {"q": q, "limit": limit, "offset": offset})
 
-  if (!v_bytes.length || !T_bytes.length)
-    throw new Error(`Token missing fields. Got: ${Object.keys(tokData).join(",")}`);
 
-  const wasmOut = await runWasm(data.w_payload, frag1, kf2, T_bytes, parseInt(seed.substring(0, 8), 16));
-  const pbk     = crypto.pbkdf2Sync(wasmOut, seed, 1000, 32, "sha256");
-  const r       = Buffer.from(pbk);
-  for (let i = 0; i < 32; i++) r[i] ^= seed.charCodeAt(i % seed.length);
-  const aesKey  = crypto.createHash("sha256").update(r).digest();
+@app.get("/home")
+async def home(limit: int = Query(20, ge=1, le=100)):
+    latest, top = await asyncio.gather(
+        _get("/api/home/latest-aired", {"limit": limit}),
+        _get("/api/top/anime", {"period": "week", "limit": limit}),
+    )
+    return {"latest_aired": latest, "top_weekly": top}
 
-  const decipher = crypto.createDecipheriv("aes-256-cbc", aesKey, iv);
-  const url      = Buffer.concat([decipher.update(v_bytes), decipher.final()]).toString("utf8").trim();
 
-  if (!url.startsWith("http")) throw new Error(`Unexpected URL: ${url}`);
+@app.get("/top")
+async def top(
+    period: str = Query("week", pattern="^(day|week|month)$"),
+    limit: int = Query(20, ge=1, le=100),
+):
+    return await _get("/api/top/anime", {"period": period, "limit": limit})
 
-  process.stdout.write(JSON.stringify({
-    url,
-    subtitles:      data.subtitles      ?? [],
-    thumbnails_vtt: data.thumbnails_vtt ?? null,
-    video_title:    data.video_title    ?? null,
-    intro_chapter:  data.intro_chapter  ?? null,
-    outro_chapter:  data.outro_chapter  ?? null,
-    video_id:       data.video_id       ?? null,
-  }));
-}
 
-main().catch((err) => {
-  process.stderr.write(err.message + "\n");
-  process.exit(1);
-});
+@app.get("/schedule")
+async def schedule():
+    return await _get("/api/schedule")
+
+
+@app.get("/info/{slug}")
+async def anime_info(slug: str):
+    meta, eps = await asyncio.gather(
+        _get(f"/api/watch/{slug}/1"),
+        _get(f"/api/episodes/{slug}"),
+    )
+    anime = meta.get("anime") or {}
+    anilist_id = _anilist_from_anime(anime)
+    ep_list = eps if isinstance(eps, list) else eps.get("data", eps.get("episodes", []))
+    return {**anime, "episodes": ep_list, "anilist_id": anilist_id}
+
+
+@app.get("/episodes/{slug}")
+async def episodes(slug: str):
+    data = await _get(f"/api/episodes/{slug}")
+    return data if isinstance(data, list) else data.get("data", data.get("episodes", data))
+
+
+@app.get("/servers/{slug}/{episode}")
+async def servers(slug: str, episode: int, anilist_id: Optional[int] = Query(None)):
+    return await _servers(slug, episode, anilist_id)
+
+
+@app.get("/stream/from-link")
+async def stream_from_link(link: str = Query(...)):
+    m = re.search(r"/e/([^?#\s]+)\?v=(\d+)", link)
+    if not m:
+        raise HTTPException(400, detail="Expected URL: https://flixcloud.cc/e/{id}?v={1|2}")
+    return await get_stream_url(m.group(1), int(m.group(2)))
+
+
+@app.get("/stream/{access_id}")
+async def stream(access_id: str, v: int = Query(2, ge=1, le=2)):
+    return await get_stream_url(access_id, v)
+
+
+@app.get("/thumbnails/{anilist_id}")
+async def thumbnails(anilist_id: int):
+    return await _get(f"/api/thumbnails/{anilist_id}")
+
+
+@app.get("/recommendations/{slug}")
+async def recommendations(slug: str):
+    return await _get(f"/api/anime/{slug}/recommendations")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("reanime:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), workers=1, reload=False)
