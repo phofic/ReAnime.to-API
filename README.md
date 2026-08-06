@@ -1,6 +1,6 @@
 # reanime-scraper
 
-A self-hosted anime streaming API that scrapes [reanime.to](https://reanime.to) and fully decrypts [flixcloud.cc](https://flixcloud.cc) HLS streams. Drop-in Consumet-style source. No headless browsers — pure Python + Node.js.
+A self-hosted anime streaming API that scrapes [reanime.to](https://reanime.to) and fully decrypts [flixcloud.cc](https://flixcloud.cc) HLS streams. Drop-in Consumet-style source. **100% pure Python** — no headless browsers, no Node.js (decryption runs the page's own WASM via `wasmtime`). This means it works on Vercel's Python serverless runtime.
 
 > **⚠️ Big change (2026):** reanime.to migrated its API to `/api/v1/*`. Old paths (`/api/search`, `/api/schedule`, `/api/watch/...`, `/api/episodes/...`) now return 404/HTML — the main cause of 502s. This codebase is fully migrated to the v1 endpoints. Some reanime.to endpoints (`/api/v1/watch/...`) now require a login token; everything this API exposes works without one.
 
@@ -22,10 +22,10 @@ A self-hosted anime streaming API that scrapes [reanime.to](https://reanime.to) 
 
 ## Setup
 
-**Requirements:** Python 3.11+, Node.js 20+
+**Requirements:** Python 3.11+
 
 ```bash
-pip install fastapi uvicorn "httpx[http2]" pycryptodome
+pip install fastapi uvicorn "httpx[http2]" pycryptodome wasmtime
 uvicorn reanime:app --host 0.0.0.0 --port 8000
 ```
 
@@ -53,7 +53,7 @@ reanime.to blocks most datacenter IP ranges (Vercel, AWS, ...) with HTTP 403.
 | `PROXY_SERVICES` | built-ins | `"name\|https://relay/?url={url};..."` — override relay list |
 | `PROXY_URL` | — | premium HTTP(S) proxy, e.g. `http://user:pass@host:port` |
 | `CACHE_ENABLED` | `1` | set `0` to disable the TTL cache |
-| `FLIX_TOKEN_RELAY` | — | relay template for the flixcloud token API, e.g. `https://api.allorigins.win/raw?url={url}` |
+> The flixcloud token API is now fetched through the same smart relay chain (no extra env var needed).
 
 ## Endpoints
 
@@ -125,19 +125,22 @@ The `slug` (a.k.a. `anime_id`) is the URL-friendly ID from reanime.to (e.g. `dem
 
 ## How the decryption works
 
-flixcloud.cc embeds streams behind a rotating WASM-based AES-256-CBC scheme; every page load gets fresh WASM constants, a one-time token, and new encrypted key material. `decrypt.mjs`:
+flixcloud.cc embeds streams behind a rotating WASM-based AES-256-CBC scheme; every page load gets fresh WASM constants, a one-time token, and new encrypted key material. `decrypt.py` does it all in Python (no Node.js):
 
-1. Fetch `flixcloud.cc/e/{access_id}?v={1|2}` — parse the SvelteKit SSR data block
+1. Fetch `flixcloud.cc/e/{access_id}?v={1|2}` — parse the SvelteKit SSR data block (JS-literal regex extraction — the block isn't strict JSON)
 2. Derive 7 obfuscated field names via 6 rounds of SHA-256 on `obfuscation_seed`
 3. Extract `frag1`, `iv` from the nested crypto object; `keyFrag2`, `token` from page data
-4. `GET /api/m3u8/{token}` — one-time payload (retries through `FLIX_TOKEN_RELAY` if blocked)
-5. Run the embed page's own WASM to derive key material
-6. PBKDF2 + XOR + SHA-256 → AES-256-CBC key → decrypt the stream URL
+4. `GET /api/m3u8/{token}` — one-time payload, fetched **through the smart relay chain** (flixcloud blocks datacenter IPs too)
+5. Run the embed page's own WASM via **wasmtime** to derive key material
+6. PBKDF2 (stdlib) + XOR + SHA-256 → AES-256-CBC key (pycryptodome) → decrypt the stream URL
+
+`decrypt.mjs` is kept in the repo as a standalone reference implementation (and works where Node.js is available, e.g. Railway) — the API itself no longer needs it.
 
 ## Files
 
 ```
 reanime/
 ├── reanime.py      # FastAPI app — endpoints, caching, smart proxy layer
-└── decrypt.mjs     # Node.js — WASM execution + PBKDF2 + AES-256-CBC decryption
+├── decrypt.py      # pure-Python WASM + PBKDF2 + AES-256-CBC decryption (active)
+└── decrypt.mjs     # Node.js reference implementation (standalone tool)
 ```

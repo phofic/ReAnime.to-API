@@ -34,6 +34,8 @@ from contextlib import asynccontextmanager
 from urllib.parse import quote, urlencode
 from typing import Any, Callable, Optional
 
+from decrypt import DecryptError, decrypt_stream, parse_embed
+
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -403,9 +405,6 @@ async def _get_json_cached(key: str, ttl: float, url: str, params: dict = None) 
 # ---------------------------------------------------------------------------
 # Decryption (pure-Python WASM pipeline — no Node.js required)
 # ---------------------------------------------------------------------------
-from decrypt import DecryptError, decrypt_stream, parse_embed  # noqa: E402
-
-
 async def get_stream_url(access_id: str, v: int = 2) -> dict:
     embed_url = f"{FLIX}/e/{access_id}?v={v}"
     # Embed page is HTML → accept_html mode; falls back to relays if blocked.
@@ -422,10 +421,11 @@ async def get_stream_url(access_id: str, v: int = 2) -> dict:
         raise HTTPException(502, detail=f"Embed parse failed: {e}")
 
     # One-time token API — flixcloud also blocks datacenter IPs, so it goes
-    # through the same smart fetch chain (direct or relays).
+    # through the same smart fetch chain (direct or relays). Tight budget so
+    # the whole decrypt pipeline fits inside serverless function time limits.
     token_url = f"{FLIX}/api/m3u8/{parsed['token']}"
     try:
-        tok_r, _tv = await _fetch_smart(token_url)
+        tok_r, _tv = await _fetch_smart(token_url, budget=min(RELAY_BUDGET, 4.0))
         token_data = tok_r.json()
     except HTTPException:
         raise

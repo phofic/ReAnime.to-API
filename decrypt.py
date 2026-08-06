@@ -150,9 +150,20 @@ def _parse_chapter(html: str, name: str) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 # WASM execution (wasmtime) — identical to decrypt.mjs runWasm()
 # ---------------------------------------------------------------------------
+_ENGINE: Optional[Engine] = None
+
+
+def _get_engine() -> Engine:
+    """Reuse one Wasmtime engine across decrypts (engine init is expensive)."""
+    global _ENGINE
+    if _ENGINE is None:
+        _ENGINE = Engine()
+    return _ENGINE
+
+
 def _run_wasm(wasm_b64: str, frag1: bytes, kf2: bytes, t_bytes: bytes,
               seed_int: int) -> bytes:
-    engine = Engine()
+    engine = _get_engine()
     store = Store(engine)
     module = Module(engine, base64.b64decode(wasm_b64))
     instance = Instance(store, module, [])
