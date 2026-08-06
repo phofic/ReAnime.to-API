@@ -1,4 +1,10 @@
 #!/usr/bin/env node
+// Polyfill for fetch if Node.js version < 18
+if (typeof fetch === 'undefined') {
+  const module = await import('node-fetch');
+  globalThis.fetch = module.default;
+}
+
 import crypto from "node:crypto";
 import { readFileSync } from "node:fs";
 
