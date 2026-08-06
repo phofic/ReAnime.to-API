@@ -17,8 +17,8 @@ A self-hosted anime streaming API that scrapes [reanime.to](https://reanime.to) 
 ## Why was it 502-ing (and how this fixes it)
 
 1. **API moved to `/api/v1/`** — every endpoint now hits the current public paths. ✅
-2. **Public CORS relays mostly died** — `corsproxy.io` is paywalled (403), `codetabs` is dead (521). Only `allorigins` still works, and it's slow (6–22s). The old code ran relays **sequentially** with 30s timeouts → requests blew past frontend timeouts → 502.
-3. **Fix:** direct-first + **concurrent relay race** with a hard deadline, plus a **relay health cache** so broken relays cost ~0ms. Total response time is bounded (`RELAY_BUDGET`, default 8s).
+2. **The old relays were dead and the headers were buggy** — `corsproxy.io` went paywalled (403), `codetabs` died (521); `allorigins` still works but is slow (6–22s). On top of that, the old code manually sent `Accept-Encoding` — which makes httpx return **raw gzip bytes**, so `r.json()` always failed and even successful relays were treated as failures → 502.
+3. **Fix:** headers fixed, endpoints migrated, plus **Jina Reader** (`r.jina.ai`) added as a fast primary relay, a **concurrent relay race** under a hard deadline, and a **relay health cache** so broken relays cost ~0ms.
 
 ## Setup
 
@@ -39,17 +39,7 @@ reanime.to blocks most datacenter IP ranges (Vercel, AWS, ...) with HTTP 403.
 | **Vercel (free relays)** | slow (6–20s) | works but rides on `allorigins`; raise `RELAY_BUDGET` if your plan allows longer functions |
 | **Vercel + premium proxy** | fast | set `PROXY_URL=https://user:pass@proxy...` (Bright Data / Oxylabs / etc.) — all traffic exits through it |
 
-If you stay on Vercel **without** a premium proxy, consider bumping the function duration
-in `vercel.json` (Pro plan) — see the sample below:
-
-```json
-{
-  "version": 2,
-  "builds": [{ "src": "reanime.py", "use": "@vercel/python", "config": { "entrypoint": "reanime:app" } }],
-  "routes": [{ "src": "/(.*)", "dest": "reanime.py" }],
-  "functions": { "reanime.py": { "maxDuration": 30 } }
-}
-```
+`vercel.json` already sets `functions.reanime.py.maxDuration = 10` (the Hobby cap). If you're on the **Pro plan** you can raise it (e.g. `30`–`60`) to give the slow-relay path more headroom.
 
 ## Environment variables
 

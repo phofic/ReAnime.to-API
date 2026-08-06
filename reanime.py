@@ -57,7 +57,6 @@ USER_AGENTS = [
 BASE_HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
     "DNT": "1",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
@@ -65,6 +64,9 @@ BASE_HEADERS = {
     "Sec-Fetch-Mode": "cors",
     "Sec-Fetch-Site": "same-origin",
     "Cache-Control": "max-age=0",
+    # NOTE: do NOT set Accept-Encoding manually — httpx only auto-decompresses
+    # gzip/br responses when it negotiates the header itself. Setting it
+    # manually returns RAW compressed bytes and breaks r.json().
 }
 
 # ---------------------------------------------------------------------------
@@ -78,15 +80,19 @@ RELAY_COOLDOWN = float(os.getenv("RELAY_COOLDOWN", "60"))
 CACHE_ENABLED = os.getenv("CACHE_ENABLED", "1").strip() not in ("0", "false", "no")
 _PREMIUM_PROXY_URL = os.getenv("PROXY_URL", "").strip() or None
 
-# Free CORS/relay proxies. Each template receives the fully percent-encoded
-# target URL as {url}. Ordered by observed reliability; the health cache
-# handles the rest. Override with PROXY_SERVICES env var.
+# Free CORS/relay proxies. Each entry is (name, url_template, extra_headers,
+# json_only) where {url} in the template is the fully percent-encoded target.
+# `json_only` relays (e.g. Jina) mangle HTML into markdown, so they are only
+# used for JSON API requests, never for the flixcloud embed page.
+# Override with PROXY_SERVICES env var: "name|template;name2|template2"
 DEFAULT_RELAY_SERVICES = [
-    ("allorigins", "https://api.allorigins.win/raw?url={url}"),
-    ("corsproxy",  "https://corsproxy.io/?url={url}"),
-    ("codetabs",   "https://api.codetabs.com/v1/proxy?quest={url}"),
-    ("thingproxy", "https://thingproxy.freeboard.io/fetch/{url}"),
-    ("corslol",    "https://api.cors.lol/?url={url}"),
+    # Jina Reader — fast (~1s) and currently the most reliable free relay
+    ("jina",       "https://r.jina.ai/{url}", {"X-Return-Format": "text"}, True),
+    ("allorigins", "https://api.allorigins.win/raw?url={url}", None, False),
+    ("corsproxy",  "https://corsproxy.io/?url={url}", None, False),
+    ("codetabs",   "https://api.codetabs.com/v1/proxy?quest={url}", None, False),
+    ("thingproxy", "https://thingproxy.freeboard.io/fetch/{url}", None, False),
+    ("corslol",    "https://api.cors.lol/?url={url}", None, False),
 ]
 
 
@@ -97,7 +103,7 @@ def _load_relay_services() -> list:
         for part in raw.split(";"):
             if "|" in part:
                 name, template = part.split("|", 1)
-                services.append((name.strip(), template.strip()))
+                services.append((name.strip(), template.strip(), None, False))
         if services:
             return services
     return list(DEFAULT_RELAY_SERVICES)
@@ -110,16 +116,22 @@ _relay_dead_until: dict[str, float] = {}
 _relay_lock = asyncio.Lock()
 
 
+_RELAY_INFO = {n: (t, h, j) for n, t, h, j in RELAY_SERVICES}
+
+
+def _relay_info(name: str) -> Optional[tuple]:
+    return _RELAY_INFO.get(name)
+
+
 def _relay_proxified_url(name: str, url: str) -> Optional[str]:
-    template = dict(RELAY_SERVICES).get(name)
-    if not template:
+    info = _relay_info(name)
+    if not info:
         return None
-    return template.format(url=quote(url, safe=""))
+    return info[0].format(url=quote(url, safe=""))
 
 
 def _is_relay_dead(name: str) -> bool:
-    until = _relay_dead_until.get(name, 0.0)
-    return time.monotonic() > 0 and until > time.monotonic()
+    return _relay_dead_until.get(name, 0.0) > time.monotonic()
 
 
 async def _mark_relay_dead(name: str, reason: str) -> None:
@@ -136,7 +148,7 @@ def relay_health() -> dict:
     now = time.monotonic()
     return {
         name: {"dead": _relay_dead_until.get(name, 0.0) > now, "template": tpl}
-        for name, tpl in RELAY_SERVICES
+        for name, tpl, _h, _j in RELAY_SERVICES
     }
 
 
@@ -240,10 +252,13 @@ async def _fetch_relay(name: str, url: str, *, params: dict = None,
     relay_url = _relay_proxified_url(name, url)
     if not relay_url:
         raise HTTPException(500, detail=f"unknown relay '{name}'")
+    info = _relay_info(name)
     headers = {
         "User-Agent": random.choice(USER_AGENTS),
         "Accept": "application/json, text/plain, */*",
     }
+    if info and info[1]:  # relay-specific headers (e.g. Jina raw text)
+        headers.update(info[1])
     if _PREMIUM_PROXY_URL:
         headers.pop("Origin", None)
     return await _client.get(relay_url, headers=headers, timeout=RELAY_TIMEOUT)
@@ -264,69 +279,106 @@ async def _relay_task(name: str, url: str, *, params: dict, accept_html: bool,
         return None, name
 
 
+async def _relay_race(url: str, *, params: dict, accept_html: bool,
+                      validator: Callable[[httpx.Response], bool],
+                      deadline: float) -> tuple[Optional[httpx.Response], Optional[str], list]:
+    """
+    Race relays concurrently until `deadline`, taking the first valid response.
+    When a round completes with zero valid responses we immediately launch a
+    fresh round (forcing every relay, ignoring the health cache) — free relays
+    like allorigins are flaky and a re-roll often lands. Returns
+    (response, via_name, errors).
+    """
+    errors: list[str] = []
+    exhausted: set[str] = set()  # relays that answered definitively this request
+
+    while time.monotonic() < deadline:
+        candidate = [
+            n for n, _t, _h, jonly in RELAY_SERVICES
+            if (not jonly or not accept_html) and n not in exhausted
+        ]
+        if not candidate:
+            break
+        alive = [n for n in candidate if not _is_relay_dead(n)]
+        if not alive:
+            # every relay is in cooldown → force one final attempt so a
+            # bursty client can't turn the health cache into instant 502s
+            alive = candidate
+        tasks = {
+            asyncio.create_task(_relay_task(n, url, params=params, accept_html=accept_html,
+                                            validator=validator)): n
+            for n in alive
+        }
+        done, pending = await asyncio.wait(
+            tasks, timeout=max(0.05, deadline - time.monotonic()),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        reroll: set[str] = set()
+        for task in done:
+            resp, name = task.result()
+            if resp is not None:
+                await _cancel_tasks(pending)
+                return resp, name, errors
+            errors.append(f"{name}: invalid")
+            exhausted.add(name)  # definitive failure → don't re-roll it
+        for t in pending:
+            reroll.add(tasks[t])  # slow/timeout → worth one more round
+        await _cancel_tasks(pending)
+        if not done:
+            break  # deadline hit while waiting
+        if not reroll:
+            break  # every relay answered definitively and none worked
+    return None, None, errors
+
+
+async def _cancel_tasks(tasks: set) -> None:
+    """Cancel and await the given tasks so they don't linger in the loop."""
+    for t in tasks:
+        t.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 async def _fetch_smart(url: str, *, params: dict = None, accept_html: bool = False,
                        budget: float = None) -> tuple[httpx.Response, str]:
     """
     Fetch `url` reliably:
-      1. direct attempt (unless PROXY_MODE=always)
+      1. direct attempts (rotated headers), unless PROXY_MODE=always
       2. concurrent relay race under a hard deadline
     Returns (response, via) where via is "direct" or the relay name.
     Raises HTTPException(502) when every path fails.
     """
-    # ---- direct ----
+    # ---- direct (2 attempts, rotating fingerprint) ----
     if PROXY_MODE != "always":
-        try:
-            r = await _fetch_direct(url, params=params, accept_html=accept_html)
-            if r.status_code == 404:
-                raise HTTPException(404, detail="Not found")
-            if r.status_code == 401:
-                raise HTTPException(401, detail="Unauthorized – reanime.to now requires a login for this endpoint")
-            if _looks_like_valid_json(r) or (accept_html and r.is_success and r.content):
-                return r, "direct"
-            # 403/429/5xx/HTML-where-JSON-expected → fall through to relays
-        except (httpx.HTTPError, asyncio.TimeoutError):
-            pass
+        for attempt in range(2):
+            try:
+                r = await _fetch_direct(url, params=params, accept_html=accept_html,
+                                        timeout=DIRECT_TIMEOUT if attempt == 0 else DIRECT_TIMEOUT + 4)
+                if r.status_code == 404:
+                    raise HTTPException(404, detail="Not found")
+                if r.status_code == 401:
+                    raise HTTPException(401, detail="Unauthorized – reanime.to now requires a login for this endpoint")
+                if _looks_like_valid_json(r) or (accept_html and r.is_success and r.content):
+                    return r, "direct"
+                # 403/429/5xx/HTML-where-JSON-expected → retry direct once, then relays
+                if attempt == 0:
+                    await asyncio.sleep(random.uniform(0.3, 0.8))
+            except (httpx.HTTPError, asyncio.TimeoutError):
+                if attempt == 0:
+                    await asyncio.sleep(random.uniform(0.3, 0.8))
 
     # ---- concurrent relay race ----
     if PROXY_MODE == "off":
         raise HTTPException(502, detail="Upstream request failed and PROXY_MODE=off")
 
-    deadline = time.monotonic() + (budget or RELAY_BUDGET)
-    alive = [name for name, _ in RELAY_SERVICES if not _is_relay_dead(name)]
-    if not alive:
-        alive = [name for name, _ in RELAY_SERVICES]  # cooldowns expired → retry all
-
     validator = (lambda r: r.is_success and bool(r.content)) if accept_html else _looks_like_valid_json
-    tasks = {
-        asyncio.create_task(_relay_task(n, url, params=params, accept_html=accept_html,
-                                        validator=validator)): n
-        for n in alive
-    }
-    errors: list[str] = []
-
-    while tasks and time.monotonic() < deadline:
-        done, pending = await asyncio.wait(
-            tasks, timeout=max(0.05, deadline - time.monotonic()),
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for task in done:
-            resp, name = task.result()
-            if resp is not None:
-                for t in pending:
-                    t.cancel()
-                return resp, name
-            errors.append(f"{name}: invalid")
-            tasks.pop(task)
-        if not done:
-            break  # budget exhausted while waiting
-        tasks = {t: n for t, n in tasks.items() if t in pending}
-
-    for t in tasks:
-        t.cancel()
-
-    detail = "; ".join(errors) if errors else "no relays attempted"
-    raise HTTPException(502, detail=f"All upstream paths failed (direct + {len(alive)} relays: {detail}). "
-                                    f"Set PROXY_URL (premium proxy) or RELAY_BUDGET higher if this persists.")
+    deadline = time.monotonic() + (budget or RELAY_BUDGET)
+    resp, via, _errors = await _relay_race(url, params=params, accept_html=accept_html,
+                                           validator=validator, deadline=deadline)
+    if resp is not None:
+        return resp, via
+    raise HTTPException(502, detail="All upstream paths failed (direct + relays). "
+                                    "Set PROXY_URL (premium proxy), deploy to Railway, or raise RELAY_BUDGET.")
 
 
 async def _get_json(url: str, params: dict = None, *, accept_html: bool = False,
@@ -357,13 +409,16 @@ _DECRYPT_MJS = str(Path(__file__).parent / "decrypt.mjs")
 
 
 async def _decrypt_embed(html: bytes) -> dict:
-    proc = await asyncio.create_subprocess_exec(
-        "node", _DECRYPT_MJS, "-",
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env={**os.environ},  # pass through FLIX_TOKEN_RELAY etc.
-    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "node", _DECRYPT_MJS, "-",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ},  # pass through FLIX_TOKEN_RELAY etc.
+        )
+    except FileNotFoundError:
+        raise HTTPException(503, detail="Node.js runtime not found — required for stream decryption")
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(input=html), timeout=25.0)
     except asyncio.TimeoutError:
@@ -379,8 +434,11 @@ async def _decrypt_embed(html: bytes) -> dict:
 
 async def get_stream_url(access_id: str, v: int = 2) -> dict:
     embed_url = f"{FLIX}/e/{access_id}?v={v}"
-    # Embed page is HTML → accept_html mode; falls back to relays if blocked
-    r, _via = await _fetch_smart(embed_url, accept_html=True)
+    # Embed page is HTML → accept_html mode; falls back to relays if blocked.
+    # Use a tighter budget than general API calls so the full decrypt pipeline
+    # fits inside serverless function time limits.
+    r, _via = await _fetch_smart(embed_url, accept_html=True,
+                                 budget=min(RELAY_BUDGET, 6.0))
     if not r.content:
         raise HTTPException(502, detail="Empty embed page")
     return await _decrypt_embed(r.content)
@@ -592,7 +650,7 @@ async def proxy_passthrough(url: str = Query(..., description="Full reanime.to /
     except Exception:
         payload = r.text[:2000]
     return {
-        "proxifiedSource": [_relay_proxified_url(n, url) for n, _ in RELAY_SERVICES],
+        "proxifiedSource": [_relay_proxified_url(n, url) for n, _t, _h, _j in RELAY_SERVICES],
         "via": via,
         "data": payload,
     }

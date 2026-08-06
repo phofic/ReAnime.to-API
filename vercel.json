@@ -14,5 +14,10 @@
       "src": "/(.*)",
       "dest": "reanime.py"
     }
-  ]
+  ],
+  "functions": {
+    "reanime.py": {
+      "maxDuration": 10
+    }
+  }
 }
