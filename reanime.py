@@ -508,10 +508,15 @@ async def _servers(slug: str, ep: int, anilist_id: Optional[int] = None) -> dict
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+APP_VERSION = "2.1-pure-python"  # bump on deploy so you can verify the live build
+
+
 @app.get("/")
 async def root():
     return {
         "status": "ok",
+        "version": APP_VERSION,
+        "decrypt": "pure-python (wasmtime, no node)",
         "mode": PROXY_MODE,
         "proxies": relay_health(),
         "endpoints": {
