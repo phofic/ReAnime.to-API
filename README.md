@@ -1,129 +1,153 @@
 # reanime-scraper
 
-A self-hosted anime streaming API that scrapes [reanime.to](https://reanime.to) and fully decrypts [flixcloud.cc](https://flixcloud.cc) HLS streams. Works as a drop-in alternative to Consumet. No headless browsers — pure Python + Node.js.
+A self-hosted anime streaming API that scrapes [reanime.to](https://reanime.to) and fully decrypts [flixcloud.cc](https://flixcloud.cc) HLS streams. Drop-in Consumet-style source. No headless browsers — pure Python + Node.js.
+
+> **⚠️ Big change (2026):** reanime.to migrated its API to `/api/v1/*`. Old paths (`/api/search`, `/api/schedule`, `/api/watch/...`, `/api/episodes/...`) now return 404/HTML — the main cause of 502s. This codebase is fully migrated to the v1 endpoints. Some reanime.to endpoints (`/api/v1/watch/...`) now require a login token; everything this API exposes works without one.
 
 ## What it does
 
-- Search anime, browse home/top charts, get airing schedules
-- Full anime info with episode lists
-- Get all available streaming servers (HD-1 sub, HD-1 dub, HD-2 sub, HD-2 dub)
-- **Decrypt the actual `.m3u8` stream URL** by reverse-engineering flixcloud.cc's rotating WASM-based AES-256-CBC encryption
-- Returns subtitles (SRT/VTT, multiple languages), thumbnail VTT sprites, intro/outro chapter timestamps
+- Search anime, browse home/top/new/upcoming charts, airing schedule
+- Full anime metadata + episode lists (`/api/v1/anime/{slug}` + `/api/v1/anime/{slug}/episodes`)
+- All streaming servers for an episode (sub/dub, HD-1/HD-2) via the public `/api/flix/{anilistId}/{ep}`
+- **Decrypt the actual `.m3u8` stream URL** (WASM + AES-256-CBC) from flixcloud.cc
+- Returns subtitles (SRT/ASS, multiple languages), thumbnail VTT sprites, intro/outro chapters
+- In-memory TTL cache on public endpoints (search-as-you-type friendly)
+- Smart anti-blocking fetch layer (see below)
+
+## Why was it 502-ing (and how this fixes it)
+
+1. **API moved to `/api/v1/`** — every endpoint now hits the current public paths. ✅
+2. **Public CORS relays mostly died** — `corsproxy.io` is paywalled (403), `codetabs` is dead (521). Only `allorigins` still works, and it's slow (6–22s). The old code ran relays **sequentially** with 30s timeouts → requests blew past frontend timeouts → 502.
+3. **Fix:** direct-first + **concurrent relay race** with a hard deadline, plus a **relay health cache** so broken relays cost ~0ms. Total response time is bounded (`RELAY_BUDGET`, default 8s).
 
 ## Setup
 
 **Requirements:** Python 3.11+, Node.js 20+
 
 ```bash
-pip install fastapi uvicorn httpx[http2] pycryptodome
-cd reanime
+pip install fastapi uvicorn "httpx[http2]" pycryptodome
 uvicorn reanime:app --host 0.0.0.0 --port 8000
 ```
+
+## Deployment (Vercel / Railway)
+
+reanime.to blocks most datacenter IP ranges (Vercel, AWS, ...) with HTTP 403.
+
+| Approach | Latency | Notes |
+|----------|---------|-------|
+| **Railway / home server** | fast (~1–3s) | egress IP usually not blocked → direct requests work |
+| **Vercel (free relays)** | slow (6–20s) | works but rides on `allorigins`; raise `RELAY_BUDGET` if your plan allows longer functions |
+| **Vercel + premium proxy** | fast | set `PROXY_URL=https://user:pass@proxy...` (Bright Data / Oxylabs / etc.) — all traffic exits through it |
+
+If you stay on Vercel **without** a premium proxy, consider bumping the function duration
+in `vercel.json` (Pro plan) — see the sample below:
+
+```json
+{
+  "version": 2,
+  "builds": [{ "src": "reanime.py", "use": "@vercel/python", "config": { "entrypoint": "reanime:app" } }],
+  "routes": [{ "src": "/(.*)", "dest": "reanime.py" }],
+  "functions": { "reanime.py": { "maxDuration": 30 } }
+}
+```
+
+## Environment variables
+
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `PROXY_MODE` | `auto` | `auto` (direct, then relays) · `always` (skip direct) · `off` (never proxy) |
+| `DIRECT_TIMEOUT` | `8` | seconds for the direct attempt |
+| `RELAY_TIMEOUT` | `10` | seconds per relay |
+| `RELAY_BUDGET` | `8` | hard deadline for the relay race (keep < function timeout) |
+| `RELAY_COOLDOWN` | `60` | seconds a failing relay is skipped |
+| `PROXY_SERVICES` | built-ins | `"name\|https://relay/?url={url};..."` — override relay list |
+| `PROXY_URL` | — | premium HTTP(S) proxy, e.g. `http://user:pass@host:port` |
+| `CACHE_ENABLED` | `1` | set `0` to disable the TTL cache |
+| `FLIX_TOKEN_RELAY` | — | relay template for the flixcloud token API, e.g. `https://api.allorigins.win/raw?url={url}` |
 
 ## Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/search?q=...&limit=20` | Search anime by name |
+| GET | `/search?q=...&limit=20` | Search anime (v1) |
 | GET | `/home?limit=20` | Latest aired + top weekly |
-| GET | `/top?period=week&limit=20` | Top anime (`day` / `week` / `month`) |
+| GET | `/new?limit=20` | New on site |
+| GET | `/upcoming?limit=20` | Upcoming |
+| GET | `/top?period=week&limit=20` | Top anime (`day`/`week`/`month`) |
 | GET | `/schedule` | Weekly airing schedule |
+| GET | `/anime/{slug}` | Full anime metadata (includes `anilist_id`) |
 | GET | `/info/{slug}` | Anime metadata + full episode list |
 | GET | `/episodes/{slug}` | Episode list only |
-| GET | `/servers/{slug}/{episode}` | All streaming servers for an episode |
-| GET | `/stream/{access_id}?v=2` | Decrypt stream → HLS URL + subtitles |
-| GET | `/stream/from-link?link={url}` | Same, but pass the full flixcloud URL |
+| GET | `/servers/{slug}/{episode}` | All streaming servers for an episode (public `/api/flix`) |
+| GET | `/stream/{access_id}?v=2` | Decrypt stream → HLS URL + subtitles + chapters |
+| GET | `/stream/from-link?link={url}` | Same, pass a full flixcloud embed URL |
 | GET | `/thumbnails/{anilist_id}` | Episode thumbnail data |
 | GET | `/recommendations/{slug}` | Related anime |
+| GET | `/proxy?url=...` | Fetch any reanime.to/flixcloud.cc URL through the smart fetch layer |
 
-The `slug` is the URL-friendly anime ID from reanime.to (e.g. `one-piece-xamk74`).
+The `slug` (a.k.a. `anime_id`) is the URL-friendly ID from reanime.to (e.g. `demon-slayer-kimetsu-no-yaiba-wvu9v4`).
 
 ## Typical flow
 
 ```
 1. GET /search?q=demon+slayer
-   → pick a slug from results
+   → pick an anime_id (slug) from results
 
 2. GET /servers/{slug}/{episode}
-   → returns sub[] and dub[] arrays, each with serverName + dataLink
-   → dataLink is a flixcloud.cc embed URL
+   → { sub: [{serverName, dataLink, dataType}], dub: [...], anilist_id }
 
 3. GET /stream/from-link?link={dataLink}
-   → returns the decrypted m3u8 URL, subtitles, thumbnail VTT, chapters
+   → { url: "...master.m3u8?token=...", subtitles, thumbnails_vtt, intro_chapter, outro_chapter }
 ```
 
 ### `/servers` response
 
 ```json
 {
-  "sub": [
-    { "serverName": "HD-2", "dataLink": "https://flixcloud.cc/e/abc123?v=2", "dataType": "sub" },
-    { "serverName": "HD-1", "dataLink": "https://flixcloud.cc/e/abc123?v=1", "dataType": "sub" }
-  ],
-  "dub": [ ... ],
-  "anilist_id": 178005,
-  "anime": { ... },
-  "intro_start": 90,
-  "intro_end": 180
+  "sub":  [{ "serverName": "HD-2", "dataLink": "https://flixcloud.cc/e/abc123?v=2", "dataType": "sub" },
+           { "serverName": "HD-1", "dataLink": "https://flixcloud.cc/e/abc123?v=1", "dataType": "sub" }],
+  "dub":  [],
+  "anime": { "anilist_id": 101922, "title": {...}, ... },
+  "anilist_id": 101922,
+  "current": null,
+  "duration": 24,
+  "intro_start": null
 }
 ```
+
+> `intro_*/outro_*` and `current` require reanime.to's authenticated `/api/v1/watch` endpoint and are `null` without a token. Intro/outro **chapters** are still available from `/stream` (decrypted from the embed).
 
 ### `/stream` response
 
 ```json
 {
-  "url": "https://fetch1.flixcloud.cc/_v7/{video_id}/master.m3u8?token=...",
-  "subtitles": [
-    { "url": "https://...", "language": "English (Track 2 (ENG))", "format": "srt", "default": true },
-    ...
-  ],
-  "thumbnails_vtt": "https://fetch1.flixcloud.cc/thumbnails_vtt/{video_id}",
+  "url": "https://fetch7.flixcloud.cc/_v7/{video_id}/master.m3u8?token=...",
+  "subtitles": [{ "url": "...", "language": "English (Dialogue)", "format": "ass", "default": true }],
+  "thumbnails_vtt": "https://fetch7.flixcloud.cc/thumbnails_vtt/{video_id}",
   "video_title": "Episode.Title.1080p.mkv",
-  "intro_chapter": null,
-  "outro_chapter": { "start": 1340, "end": 1420, "title": "Credits" },
-  "video_id": "0f477519-..."
+  "intro_chapter": { "start": 133, "end": 223, "title": "OP" },
+  "outro_chapter": { "start": 1361, "end": 1451, "title": "ED" },
+  "video_id": "5ad3792b-..."
 }
 ```
 
-The `thumbnails_vtt` URL returns a standard WEBVTT file with sprite sheet regions (`160×90`, 5-second intervals) for seek preview thumbnails.
-
-## Performance
-
-Full pipeline from slug + episode to playable stream:
-
-| Step | Time |
-|------|------|
-| `/servers` (reanime.to flix API) | ~700ms |
-| `/stream` — embed page fetch | ~1,200ms |
-| `/stream` — token API + WASM + AES | ~350ms |
-| **Total cold** | **~2.5–3s** |
-
-All latency is network — the crypto itself (WASM + PBKDF2 + AES) takes under 10ms.
+> **Note:** flixcloud tokens are one-time-use (`410 Gone` on reuse) and stream URLs are short-lived JWTs (~6h). **Do not cache `/stream` responses.**
 
 ## How the decryption works
 
-flixcloud.cc embeds streams behind a rotating WASM-based encryption scheme. Every page load gets a fresh WASM binary with different constants, a new one-time token, and new encrypted key material.
+flixcloud.cc embeds streams behind a rotating WASM-based AES-256-CBC scheme; every page load gets fresh WASM constants, a one-time token, and new encrypted key material. `decrypt.mjs`:
 
-The decryption pipeline (`decrypt.mjs`):
-
-1. Fetch `flixcloud.cc/e/{access_id}?v={1|2}` — parse SvelteKit SSR data block
+1. Fetch `flixcloud.cc/e/{access_id}?v={1|2}` — parse the SvelteKit SSR data block
 2. Derive 7 obfuscated field names via 6 rounds of SHA-256 on `obfuscation_seed`
-3. Extract `frag1`, `iv` from nested crypto object; `keyFrag2`, `token` from page data
-4. `GET /api/m3u8/{token}` — one-time payload; field keys = `sha256(token+"vid")[:10]` and `sha256(token+"key")[:10]`
-5. Run the embed page's own WASM: `out[i] = ((frag1[i] ^ kf2[i] ^ T[i]) * 2 + 16) & 0xFF) ^ ((i * 35 + seed_int) & 0xFF)`
-6. `key_material = PBKDF2(wasm_out, salt=seed, iterations=1000, len=32, hash=SHA-256)`
-7. `key_material[i] ^= ord(seed[i % len(seed)])`
-8. `aes_key = SHA-256(key_material)`
-9. `stream_url = AES-256-CBC_decrypt(aes_key, iv, encrypted_url).trim()`
-
-The WASM is executed via Node.js `WebAssembly.instantiate` using the binary embedded in the page — no hardcoded constants, works across WASM rotations.
-
-> **Note:** Tokens are one-time-use. The token API returns `410 Gone` on reuse. Stream URLs are short-lived JWTs (~6 hours). Do not cache `/stream` responses.
+3. Extract `frag1`, `iv` from the nested crypto object; `keyFrag2`, `token` from page data
+4. `GET /api/m3u8/{token}` — one-time payload (retries through `FLIX_TOKEN_RELAY` if blocked)
+5. Run the embed page's own WASM to derive key material
+6. PBKDF2 + XOR + SHA-256 → AES-256-CBC key → decrypt the stream URL
 
 ## Files
 
 ```
 reanime/
-├── reanime.py      # FastAPI app — all endpoints and reanime.to API wrappers
+├── reanime.py      # FastAPI app — endpoints, caching, smart proxy layer
 └── decrypt.mjs     # Node.js — WASM execution + PBKDF2 + AES-256-CBC decryption
 ```

@@ -16,12 +16,27 @@ function rt(b64) {
   return Buffer.from(b64, "base64");
 }
 
-async function fetchJson(url, headers = {}) {
-  const r = await fetch(url, {
-    headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", ...headers },
-  });
-  if (!r.ok) throw new Error(`HTTP ${r.status} from ${url}`);
-  return r.json();
+async function fetchJson(url, headers = {}, tries = 0) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 15000);
+  try {
+    const r = await fetch(url, {
+      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", ...headers },
+      signal: ctrl.signal,
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status} from ${url}`);
+    return await r.json();
+  } catch (e) {
+    // Fall back to a relay proxy (e.g. allorigins) if the deployment IP is
+    // blocked by flixcloud. Configure with FLIX_TOKEN_RELAY="https://api.allorigins.win/raw?url={url}"
+    const relay = process.env.FLIX_TOKEN_RELAY;
+    if (tries === 0 && relay) {
+      return fetchJson(relay.replace("{url}", encodeURIComponent(url)), headers, 1);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function le(seed) {

@@ -1,13 +1,40 @@
 #!/usr/bin/env python3
+"""
+ReAnime.to → JSON API (Vercel/Railway friendly).
+
+Scrapes the public reanime.to API (v1) and fully decrypts flixcloud.cc HLS
+streams without a browser. Works as a drop-in Consumet-style source.
+
+Why proxies?
+  reanime.to sits behind Cloudflare and blocks datacenter IP ranges
+  (Vercel/AWS/GCP...) with HTTP 403. We therefore:
+    1. try the target DIRECT first (fast when the egress IP isn't blocked)
+    2. if blocked/timeout → race ALL relay proxies CONCURRENTLY under a hard
+       deadline and take the first valid JSON response
+  Broken relays are remembered (health cache) so they cost ~0ms next time.
+
+Env vars
+  PROXY_MODE      auto | always | off   (default auto)
+  DIRECT_TIMEOUT  seconds for the direct attempt   (default 8)
+  RELAY_TIMEOUT   seconds per relay                (default 10)
+  RELAY_BUDGET    hard deadline for the relay race (default 8)
+  RELAY_COOLDOWN  seconds a failing relay is skipped (default 60)
+  PROXY_SERVICES  "name|template;name2|template2"  (override relay list)
+  PROXY_URL       optional premium HTTP(S) proxy (Bright Data / Oxylabs / ...)
+                  ALL upstream traffic (direct + relays) exits through it.
+  CACHE_ENABLED   0/1  in-memory TTL cache on public endpoints (default 1)
+"""
+
 import asyncio
 import json
 import os
 import re
 import random
+import time
 from contextlib import asynccontextmanager
 from urllib.parse import quote, urlencode
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
@@ -16,7 +43,9 @@ from fastapi.middleware.cors import CORSMiddleware
 BASE = "https://reanime.to"
 FLIX = "https://flixcloud.cc"
 
-# ---- NEW: list of realistic User-Agents ----
+# ---------------------------------------------------------------------------
+# Browser fingerprint rotation
+# ---------------------------------------------------------------------------
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -25,7 +54,6 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0",
 ]
 
-# ---- Base headers (without User-Agent, we'll set it per request) ----
 BASE_HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
@@ -37,57 +65,32 @@ BASE_HEADERS = {
     "Sec-Fetch-Mode": "cors",
     "Sec-Fetch-Site": "same-origin",
     "Cache-Control": "max-age=0",
-    "Origin": BASE,
 }
 
 # ---------------------------------------------------------------------------
-# PROXY CHAIN (architecture mirroring Proxify-Streams' ProxyGenerator)
+# Configuration (env driven)
 # ---------------------------------------------------------------------------
-# reanime.to (and flixcloud.cc) sit behind Cloudflare-style bot protection and
-# block datacenter IP ranges (Vercel, Railway, ...) with HTTP 403 — rotating
-# User-Agents can't fix an IP-based block. The fix is to route upstream
-# requests through relay proxies: the upstream site then sees the relay's IP
-# instead of ours, exactly like Proxify-Streams does for HLS streams.
-#
-# Each relay is (name, url_template) where {url} is the fully percent-encoded
-# target. Override with PROXY_SERVICES="name|template;name2|template2".
-DEFAULT_PROXY_SERVICES = [
+PROXY_MODE = os.getenv("PROXY_MODE", "auto").strip().lower()
+DIRECT_TIMEOUT = float(os.getenv("DIRECT_TIMEOUT", "8"))
+RELAY_TIMEOUT = float(os.getenv("RELAY_TIMEOUT", "10"))
+RELAY_BUDGET = float(os.getenv("RELAY_BUDGET", "8"))
+RELAY_COOLDOWN = float(os.getenv("RELAY_COOLDOWN", "60"))
+CACHE_ENABLED = os.getenv("CACHE_ENABLED", "1").strip() not in ("0", "false", "no")
+_PREMIUM_PROXY_URL = os.getenv("PROXY_URL", "").strip() or None
+
+# Free CORS/relay proxies. Each template receives the fully percent-encoded
+# target URL as {url}. Ordered by observed reliability; the health cache
+# handles the rest. Override with PROXY_SERVICES env var.
+DEFAULT_RELAY_SERVICES = [
     ("allorigins", "https://api.allorigins.win/raw?url={url}"),
     ("corsproxy",  "https://corsproxy.io/?url={url}"),
     ("codetabs",   "https://api.codetabs.com/v1/proxy?quest={url}"),
+    ("thingproxy", "https://thingproxy.freeboard.io/fetch/{url}"),
+    ("corslol",    "https://api.cors.lol/?url={url}"),
 ]
 
-# auto  = try direct first, fall back to relays when blocked (default)
-# always = skip direct, always go through the relay chain
-# off   = original behaviour (never proxy)
-PROXY_MODE = os.getenv("PROXY_MODE", "auto").strip().lower()
 
-# Optional premium/private HTTP(S) proxy (e.g. Bright Data, Oxylabs, ...).
-# When set, ALL upstream traffic (direct + relay) exits through this proxy,
-# giving you a rotating-residential escape hatch if the free relays also 403.
-_PREMIUM_PROXY_URL = os.getenv("PROXY_URL", "").strip() or None
-
-
-class ReanimeProxy:
-    """
-    Proxy chain — the ReAnime equivalent of Proxify-Streams' ProxyGenerator.
-    Builds relay URLs that fetch a target on our behalf from another IP.
-    """
-
-    def __init__(self, services: Optional[list] = None):
-        self.services = services if services is not None else _load_proxy_services()
-
-    def proxified_url(self, name: str, url: str) -> Optional[str]:
-        template = dict(self.services).get(name)
-        if not template:
-            return None
-        return template.format(url=quote(url, safe=""))
-
-    def all_proxified(self, url: str) -> list:
-        return [self.proxified_url(name, url) for name, _ in self.services]
-
-
-def _load_proxy_services() -> list:
+def _load_relay_services() -> list:
     raw = os.getenv("PROXY_SERVICES", "").strip()
     if raw:
         services = []
@@ -97,57 +100,71 @@ def _load_proxy_services() -> list:
                 services.append((name.strip(), template.strip()))
         if services:
             return services
-    return list(DEFAULT_PROXY_SERVICES)
+    return list(DEFAULT_RELAY_SERVICES)
 
 
-proxy_chain = ReanimeProxy()
+RELAY_SERVICES = _load_relay_services()
+
+# relay health: name -> timestamp until which it is skipped
+_relay_dead_until: dict[str, float] = {}
+_relay_lock = asyncio.Lock()
 
 
-async def _fetch_via_proxy(url: str, *, params: dict = None, as_json: bool = True,
-                           headers: dict = None) -> tuple:
-    """
-    Fetch a URL through the relay chain (shuffled for load spreading).
-    Returns (data, relay_name) — parsed JSON if as_json else an httpx.Response.
-    Raises HTTPException(502) if every relay fails.
-    """
-    if params:
-        query = urlencode([(k, v) for k, v in params.items() if v is not None])
-        if query:
-            url = f"{url}?{query}" if "?" not in url else f"{url}&{query}"
-
-    services = proxy_chain.services[:]
-    random.shuffle(services)
-    last_err = f"upstream blocked ({PROXY_MODE} mode)"
-
-    for name, _ in services:
-        relay = proxy_chain.proxified_url(name, url)
-        if not relay:
-            continue
-        relay_headers = headers or {
-            "Accept": "application/json, text/plain, */*",
-            "User-Agent": random.choice(USER_AGENTS),
-        }
-        try:
-            r = await _client.get(relay, headers=relay_headers, timeout=30.0)
-            if r.status_code != 200:
-                last_err = f"relay '{name}' → HTTP {r.status_code}"
-                continue
-            if as_json:
-                try:
-                    return r.json(), name
-                except Exception:
-                    last_err = f"relay '{name}' → non-JSON response"
-                    continue
-            return r, name
-        except httpx.HTTPError as e:
-            last_err = f"relay '{name}' → {e}"
-            continue
-
-    raise HTTPException(502, detail=f"All proxy relays failed ({last_err})")
+def _relay_proxified_url(name: str, url: str) -> Optional[str]:
+    template = dict(RELAY_SERVICES).get(name)
+    if not template:
+        return None
+    return template.format(url=quote(url, safe=""))
 
 
-_DECRYPT_MJS = str(Path(__file__).parent / "decrypt.mjs")
+def _is_relay_dead(name: str) -> bool:
+    until = _relay_dead_until.get(name, 0.0)
+    return time.monotonic() > 0 and until > time.monotonic()
 
+
+async def _mark_relay_dead(name: str, reason: str) -> None:
+    async with _relay_lock:
+        _relay_dead_until[name] = time.monotonic() + RELAY_COOLDOWN
+
+
+async def _mark_relay_alive(name: str) -> None:
+    async with _relay_lock:
+        _relay_dead_until.pop(name, None)
+
+
+def relay_health() -> dict:
+    now = time.monotonic()
+    return {
+        name: {"dead": _relay_dead_until.get(name, 0.0) > now, "template": tpl}
+        for name, tpl in RELAY_SERVICES
+    }
+
+
+# ---------------------------------------------------------------------------
+# In-memory TTL cache (per-warm-instance; great for search-as-you-type)
+# ---------------------------------------------------------------------------
+_cache: dict[str, tuple[float, Any]] = {}
+_cache_lock = asyncio.Lock()
+
+
+async def _cache_get(key: str) -> Optional[Any]:
+    async with _cache_lock:
+        hit = _cache.get(key)
+        if hit and hit[0] > time.monotonic():
+            return hit[1]
+        if hit:
+            _cache.pop(key, None)
+    return None
+
+
+async def _cache_set(key: str, value: Any, ttl: float) -> None:
+    async with _cache_lock:
+        _cache[key] = (time.monotonic() + ttl, value)
+
+
+# ---------------------------------------------------------------------------
+# HTTP client
+# ---------------------------------------------------------------------------
 _client: Optional[httpx.AsyncClient] = None
 
 
@@ -156,13 +173,12 @@ async def lifespan(_app):
     global _client
     client_kwargs = dict(
         http2=True,
-        timeout=httpx.Timeout(20.0),
+        timeout=httpx.Timeout(max(RELAY_TIMEOUT, DIRECT_TIMEOUT) + 5.0),
         limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
         follow_redirects=True,
-        # Do not set global headers here; we'll pass per request
     )
     if _PREMIUM_PROXY_URL:
-        # All traffic exits through your premium proxy (rotating IPs → no 403s)
+        # Optional premium/rotating proxy — all traffic exits through it
         client_kwargs["proxy"] = _PREMIUM_PROXY_URL
     _client = httpx.AsyncClient(**client_kwargs)
     yield
@@ -173,90 +189,171 @@ app = FastAPI(title="ReAnime Scraper", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
-def _browser_headers(base: str) -> dict:
-    """Browser-like headers with a rotating User-Agent and Referer."""
+def _browser_headers(base: str, accept_html: bool = False) -> dict:
+    accept = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" if accept_html \
+        else "application/json, text/plain, */*"
     return {
         **BASE_HEADERS,
+        "Accept": accept,
         "User-Agent": random.choice(USER_AGENTS),
         "Referer": random.choice([
-            f"{base}/",
-            f"{base}/search",
-            f"{base}/home",
-            "https://www.google.com/",
-            "https://www.bing.com/",
+            f"{base}/", f"{base}/home", f"{base}/search",
+            "https://www.google.com/", "https://www.bing.com/",
         ]),
         "Origin": base,
     }
 
 
-# ---- _get with rotating headers, retry AND proxy-chain fallback ----
-async def _get(path: str, params: dict = None, base: str = BASE) -> Any:
+# ---------------------------------------------------------------------------
+# Fetch core: direct-first, then concurrent relay race
+# ---------------------------------------------------------------------------
+def _looks_like_valid_json(r: httpx.Response) -> bool:
+    if not r.is_success:
+        return False
+    ctype = (r.headers.get("content-type") or "").lower()
+    if ctype and "json" not in ctype and "text" not in ctype:
+        return False
+    try:
+        r.json()
+        return True
+    except Exception:
+        return False
+
+
+async def _fetch_direct(url: str, *, params: dict = None, accept_html: bool = False,
+                        timeout: float = None) -> httpx.Response:
+    headers = _browser_headers(BASE if url.startswith(BASE) else FLIX, accept_html=accept_html)
+    if _PREMIUM_PROXY_URL:
+        headers.pop("Origin", None)  # premium proxies choke on mismatched Origin
+    return await _client.get(url, params=params, headers=headers,
+                             timeout=timeout or DIRECT_TIMEOUT)
+
+
+async def _fetch_relay(name: str, url: str, *, params: dict = None,
+                       accept_html: bool = False) -> httpx.Response:
+    """Fetch through a single relay proxy. Raises on network failure; the
+    caller validates the response body."""
+    if params:
+        query = urlencode([(k, v) for k, v in params.items() if v is not None])
+        if query:
+            url = f"{url}?{query}" if "?" not in url else f"{url}&{query}"
+    relay_url = _relay_proxified_url(name, url)
+    if not relay_url:
+        raise HTTPException(500, detail=f"unknown relay '{name}'")
+    headers = {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "application/json, text/plain, */*",
+    }
+    if _PREMIUM_PROXY_URL:
+        headers.pop("Origin", None)
+    return await _client.get(relay_url, headers=headers, timeout=RELAY_TIMEOUT)
+
+
+async def _relay_task(name: str, url: str, *, params: dict, accept_html: bool,
+                      validator: Callable[[httpx.Response], bool]) -> tuple[Optional[httpx.Response], str]:
+    """Returns (response, name) if valid, (None, name) otherwise."""
+    try:
+        r = await _fetch_relay(name, url, params=params, accept_html=accept_html)
+        if validator(r):
+            await _mark_relay_alive(name)
+            return r, name
+        await _mark_relay_dead(name, f"invalid response HTTP {r.status_code}")
+        return None, name
+    except (httpx.HTTPError, asyncio.TimeoutError) as e:
+        await _mark_relay_dead(name, str(e))
+        return None, name
+
+
+async def _fetch_smart(url: str, *, params: dict = None, accept_html: bool = False,
+                       budget: float = None) -> tuple[httpx.Response, str]:
     """
-    GET with rotating User-Agent/browser headers and a retry loop.
-
-    If the upstream still blocks us (HTTP 403/429 — Cloudflare IP block),
-    the request is re-routed through the relay proxy chain so the upstream
-    sees the relay's IP instead of ours (Proxify-Streams style).
+    Fetch `url` reliably:
+      1. direct attempt (unless PROXY_MODE=always)
+      2. concurrent relay race under a hard deadline
+    Returns (response, via) where via is "direct" or the relay name.
+    Raises HTTPException(502) when every path fails.
     """
-    url = f"{base}{path}"
-    mode = PROXY_MODE
-    if mode == "always":
-        data, _via = await _fetch_via_proxy(url, params=params, as_json=True)
-        return data
-
-    max_direct = 2 if mode == "auto" else 3  # fall back to relays fast in auto
-    last_err = None
-
-    for attempt in range(max_direct):
-        headers = _browser_headers(base)
-        if attempt > 0:
-            await asyncio.sleep(random.uniform(0.4, 1.0))
-
+    # ---- direct ----
+    if PROXY_MODE != "always":
         try:
-            r = await _client.get(url, params=params, headers=headers)
-        except httpx.HTTPError as e:
-            last_err = f"network: {e}"
-            continue
+            r = await _fetch_direct(url, params=params, accept_html=accept_html)
+            if r.status_code == 404:
+                raise HTTPException(404, detail="Not found")
+            if r.status_code == 401:
+                raise HTTPException(401, detail="Unauthorized – reanime.to now requires a login for this endpoint")
+            if _looks_like_valid_json(r) or (accept_html and r.is_success and r.content):
+                return r, "direct"
+            # 403/429/5xx/HTML-where-JSON-expected → fall through to relays
+        except (httpx.HTTPError, asyncio.TimeoutError):
+            pass
 
-        if r.status_code in (403, 429):
-            last_err = f"HTTP {r.status_code}"
-            if mode == "off" and attempt == max_direct - 1:
-                raise HTTPException(403, detail="Access denied – try again later")
-            continue
+    # ---- concurrent relay race ----
+    if PROXY_MODE == "off":
+        raise HTTPException(502, detail="Upstream request failed and PROXY_MODE=off")
 
-        if r.status_code == 404:
-            raise HTTPException(404, detail="Not found")
+    deadline = time.monotonic() + (budget or RELAY_BUDGET)
+    alive = [name for name, _ in RELAY_SERVICES if not _is_relay_dead(name)]
+    if not alive:
+        alive = [name for name, _ in RELAY_SERVICES]  # cooldowns expired → retry all
 
-        if r.is_success:
-            try:
-                return r.json()
-            except Exception:
-                last_err = "Invalid JSON from upstream"
-                continue
+    validator = (lambda r: r.is_success and bool(r.content)) if accept_html else _looks_like_valid_json
+    tasks = {
+        asyncio.create_task(_relay_task(n, url, params=params, accept_html=accept_html,
+                                        validator=validator)): n
+        for n in alive
+    }
+    errors: list[str] = []
 
-        last_err = f"HTTP {r.status_code}"
-        if r.status_code >= 500 or attempt == max_direct - 1:
-            raise HTTPException(r.status_code, detail=r.text[:300])
+    while tasks and time.monotonic() < deadline:
+        done, pending = await asyncio.wait(
+            tasks, timeout=max(0.05, deadline - time.monotonic()),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in done:
+            resp, name = task.result()
+            if resp is not None:
+                for t in pending:
+                    t.cancel()
+                return resp, name
+            errors.append(f"{name}: invalid")
+            tasks.pop(task)
+        if not done:
+            break  # budget exhausted while waiting
+        tasks = {t: n for t, n in tasks.items() if t in pending}
 
-    # Direct attempts exhausted → relay through the proxy chain
-    if mode == "off":
-        raise HTTPException(502, detail=f"Upstream request failed ({last_err})")
-    data, _via = await _fetch_via_proxy(url, params=params, as_json=True)
+    for t in tasks:
+        t.cancel()
+
+    detail = "; ".join(errors) if errors else "no relays attempted"
+    raise HTTPException(502, detail=f"All upstream paths failed (direct + {len(alive)} relays: {detail}). "
+                                    f"Set PROXY_URL (premium proxy) or RELAY_BUDGET higher if this persists.")
+
+
+async def _get_json(url: str, params: dict = None, *, accept_html: bool = False,
+                    budget: float = None) -> Any:
+    r, via = await _fetch_smart(url, params=params, accept_html=accept_html, budget=budget)
+    try:
+        return r.json()
+    except Exception:
+        raise HTTPException(502, detail=f"Relay '{via}' returned non-JSON body")
+
+
+async def _get_json_cached(key: str, ttl: float, url: str, params: dict = None) -> Any:
+    """TTL-cached variant of _get_json (only when CACHE_ENABLED)."""
+    if not CACHE_ENABLED:
+        return await _get_json(url, params)
+    hit = await _cache_get(key)
+    if hit is not None:
+        return hit
+    data = await _get_json(url, params)
+    await _cache_set(key, data, ttl)
     return data
 
 
-# ---- Everything below remains exactly as in your original ----
-def _anilist_from_anime(anime: dict) -> Optional[int]:
-    if not anime:
-        return None
-    if anime.get("anilist"):
-        return int(anime["anilist"])
-    for key in ("extra_large", "large", "medium"):
-        url = (anime.get("cover_image") or {}).get(key, "")
-        m = re.search(r"/bx(\d+)-", url)
-        if m:
-            return int(m.group(1))
-    return None
+# ---------------------------------------------------------------------------
+# Decryption (Node.js WASM pipeline)
+# ---------------------------------------------------------------------------
+_DECRYPT_MJS = str(Path(__file__).parent / "decrypt.mjs")
 
 
 async def _decrypt_embed(html: bytes) -> dict:
@@ -265,81 +362,114 @@ async def _decrypt_embed(html: bytes) -> dict:
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env={**os.environ},  # pass through FLIX_TOKEN_RELAY etc.
     )
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(input=html), timeout=20.0)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(input=html), timeout=25.0)
     except asyncio.TimeoutError:
         proc.kill()
         raise HTTPException(504, detail="Decrypt subprocess timed out")
     if proc.returncode != 0:
         raise HTTPException(502, detail=f"Decrypt error: {stderr.decode()[:300]}")
-    return json.loads(stdout)
+    try:
+        return json.loads(stdout)
+    except Exception:
+        raise HTTPException(502, detail="Decrypt produced invalid JSON")
 
 
 async def get_stream_url(access_id: str, v: int = 2) -> dict:
-    # For stream endpoints, we also need to pass proper headers.
-    # Use a random User-Agent here as well.
-    headers = {
-        **BASE_HEADERS,
-        "User-Agent": random.choice(USER_AGENTS),
-        "Referer": f"{BASE}/",
-        "Origin": BASE,
-    }
     embed_url = f"{FLIX}/e/{access_id}?v={v}"
-    r = await _client.get(embed_url, headers=headers)
-    if r.status_code in (403, 429) or PROXY_MODE == "always":
-        # flixcloud also blocks datacenter IPs → fetch the embed HTML via relays
-        r, _via = await _fetch_via_proxy(embed_url, as_json=False)
-    elif not r.is_success:
-        raise HTTPException(r.status_code, detail=f"Embed fetch failed: {r.status_code}")
+    # Embed page is HTML → accept_html mode; falls back to relays if blocked
+    r, _via = await _fetch_smart(embed_url, accept_html=True)
+    if not r.content:
+        raise HTTPException(502, detail="Empty embed page")
     return await _decrypt_embed(r.content)
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _anilist_from_anime(anime: dict) -> Optional[int]:
+    if not anime:
+        return None
+    if anime.get("anilist_id"):
+        return int(anime["anilist_id"])
+    for key in ("extra_large", "large", "medium"):
+        url = (anime.get("cover_image") or {}).get(key, "")
+        m = re.search(r"/bx(\d+)-", url)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def _unwrap_episodes(data: Any) -> list:
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return data.get("data") or data.get("episodes") or []
+    return []
+
+
+_SERVER_ORDER = {"HD-2": 0, "HD-1": 1}
+
+
+def _sort_servers(servers: list) -> list:
+    return sorted(servers, key=lambda s: _SERVER_ORDER.get(s.get("serverName", ""), 9))
+
+
 async def _servers(slug: str, ep: int, anilist_id: Optional[int] = None) -> dict:
-    watch = await _get(f"/api/watch/{slug}/{ep}")
-    aid = anilist_id or _anilist_from_anime(watch.get("anime"))
+    # anime info (public v1) → derive anilist_id if not provided
+    anime = {}
+    aid = anilist_id
+    try:
+        anime = await _get_json_cached(f"anime:{slug}", 3600, f"{BASE}/api/v1/anime/{slug}")
+        aid = aid or _anilist_from_anime(anime)
+    except HTTPException:
+        pass
 
     flix: dict = {}
     if aid:
         try:
-            flix = await _get(f"/api/flix/{aid}/{ep}")
+            flix = await _get_json_cached(
+                f"flix:{aid}:{ep}", 300, f"{BASE}/api/flix/{aid}/{ep}")
         except HTTPException:
             pass
 
-    links = list(watch.get("episode_links") or [])
+    links = []
     if flix.get("success") and flix.get("servers"):
-        seen = {s.get("$id") for s in links}
-        for s in flix["servers"]:
-            if s.get("$id") not in seen:
-                links.append(s)
-
-    _order = {"HD-2": 0, "HD-1": 1}
-    _sort = lambda lst: sorted(lst, key=lambda s: _order.get(s.get("serverName", ""), 9))
+        links = list(flix["servers"])
 
     return {
-        "sub":         _sort([s for s in links if s.get("dataType") in ("sub", "s-sub")]),
-        "dub":         _sort([s for s in links if s.get("dataType") in ("dub", "s-dub")]),
-        "anime":       watch.get("anime"),
-        "current":     watch.get("current"),
-        "duration":    watch.get("duration"),
-        "intro_start": watch.get("intro_start"),
-        "intro_end":   watch.get("intro_end"),
-        "outro_start": watch.get("outro_start"),
-        "outro_end":   watch.get("outro_end"),
+        "sub":         _sort_servers([s for s in links if s.get("dataType") in ("sub", "s-sub")]),
+        "dub":         _sort_servers([s for s in links if s.get("dataType") in ("dub", "s-dub")]),
+        "anime":       anime or None,
+        "current":     None,  # requires auth (reanime.to /api/v1/watch)
+        "duration":    anime.get("duration") if isinstance(anime, dict) else None,
+        "intro_start": None,  # requires auth
+        "intro_end":   None,
+        "outro_start": None,
+        "outro_end":   None,
         "anilist_id":  aid,
     }
 
 
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 @app.get("/")
 async def root():
     return {
         "status": "ok",
+        "mode": PROXY_MODE,
+        "proxies": relay_health(),
         "endpoints": {
             "search":          "GET /search?q=...&limit=20",
             "home":            "GET /home?limit=20",
+            "new":             "GET /new?limit=20",
+            "upcoming":        "GET /upcoming?limit=20",
             "top":             "GET /top?period=week&limit=20",
             "schedule":        "GET /schedule",
-            "proxy":           "GET /proxy?url={reanime.to_url} (relay fetch)",
+            "anime":           "GET /anime/{slug}",
             "info":            "GET /info/{slug}",
             "episodes":        "GET /episodes/{slug}",
             "servers":         "GET /servers/{slug}/{episode}[?anilist_id=...]",
@@ -347,6 +477,7 @@ async def root():
             "stream_link":     "GET /stream/from-link?link={flixcloud_url}",
             "thumbnails":      "GET /thumbnails/{anilist_id}",
             "recommendations": "GET /recommendations/{slug}",
+            "proxy":           "GET /proxy?url={reanime.to_or_flixcloud_url}",
         },
     }
 
@@ -357,16 +488,30 @@ async def search(
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
 ):
-    return await _get("/api/search", {"q": q, "limit": limit, "offset": offset})
+    return await _get_json_cached(f"search:{q}:{limit}:{offset}", 60,
+                                  f"{BASE}/api/v1/search",
+                                  {"q": q, "limit": limit, "offset": offset})
 
 
 @app.get("/home")
 async def home(limit: int = Query(20, ge=1, le=100)):
     latest, top = await asyncio.gather(
-        _get("/api/home/latest-aired", {"limit": limit}),
-        _get("/api/top/anime", {"period": "week", "limit": limit}),
+        _get_json_cached(f"home:latest:{limit}", 120, f"{BASE}/api/v1/home/latest-aired", {"limit": limit}),
+        _get_json_cached(f"home:top:{limit}", 300, f"{BASE}/api/v1/top/anime", {"period": "week", "limit": limit}),
     )
     return {"latest_aired": latest, "top_weekly": top}
+
+
+@app.get("/new")
+async def new_on_site(limit: int = Query(20, ge=1, le=100)):
+    return await _get_json_cached(f"home:new:{limit}", 300,
+                                  f"{BASE}/api/v1/home/new-on-site", {"limit": limit})
+
+
+@app.get("/upcoming")
+async def upcoming(limit: int = Query(20, ge=1, le=100)):
+    return await _get_json_cached(f"home:upcoming:{limit}", 300,
+                                  f"{BASE}/api/v1/home/upcoming", {"limit": limit})
 
 
 @app.get("/top")
@@ -374,30 +519,36 @@ async def top(
     period: str = Query("week", pattern="^(day|week|month)$"),
     limit: int = Query(20, ge=1, le=100),
 ):
-    return await _get("/api/top/anime", {"period": period, "limit": limit})
+    return await _get_json_cached(f"top:{period}:{limit}", 300,
+                                  f"{BASE}/api/v1/top/anime",
+                                  {"period": period, "limit": limit})
 
 
 @app.get("/schedule")
 async def schedule():
-    return await _get("/api/schedule")
+    return await _get_json_cached("schedule", 600, f"{BASE}/api/v1/schedule")
+
+
+@app.get("/anime/{slug}")
+async def anime_info_raw(slug: str):
+    return await _get_json_cached(f"anime:{slug}", 3600, f"{BASE}/api/v1/anime/{slug}")
 
 
 @app.get("/info/{slug}")
 async def anime_info(slug: str):
-    meta, eps = await asyncio.gather(
-        _get(f"/api/watch/{slug}/1"),
-        _get(f"/api/episodes/{slug}"),
+    anime, eps_data = await asyncio.gather(
+        _get_json_cached(f"anime:{slug}", 3600, f"{BASE}/api/v1/anime/{slug}"),
+        _get_json_cached(f"episodes:{slug}", 3600, f"{BASE}/api/v1/anime/{slug}/episodes"),
     )
-    anime = meta.get("anime") or {}
-    anilist_id = _anilist_from_anime(anime)
-    ep_list = eps if isinstance(eps, list) else eps.get("data", eps.get("episodes", []))
-    return {**anime, "episodes": ep_list, "anilist_id": anilist_id}
+    return {**anime, "episodes": _unwrap_episodes(eps_data),
+            "anilist_id": _anilist_from_anime(anime)}
 
 
 @app.get("/episodes/{slug}")
 async def episodes(slug: str):
-    data = await _get(f"/api/episodes/{slug}")
-    return data if isinstance(data, list) else data.get("data", data.get("episodes", data))
+    data = await _get_json_cached(f"episodes:{slug}", 3600,
+                                  f"{BASE}/api/v1/anime/{slug}/episodes")
+    return _unwrap_episodes(data)
 
 
 @app.get("/servers/{slug}/{episode}")
@@ -420,30 +571,28 @@ async def stream(access_id: str, v: int = Query(2, ge=1, le=2)):
 
 @app.get("/thumbnails/{anilist_id}")
 async def thumbnails(anilist_id: int):
-    return await _get(f"/api/thumbnails/{anilist_id}")
+    return await _get_json_cached(f"thumbnails:{anilist_id}", 3600,
+                                  f"{BASE}/api/thumbnails/{anilist_id}")
 
 
 @app.get("/recommendations/{slug}")
 async def recommendations(slug: str):
-    return await _get(f"/api/anime/{slug}/recommendations")
+    return await _get_json_cached(f"rec:{slug}", 600,
+                                  f"{BASE}/api/v1/anime/{slug}/recommendations")
 
 
 @app.get("/proxy")
-async def proxy_passthrough(url: str = Query(..., description="Full reanime.to / flixcloud.cc URL to fetch through the relay chain (Proxify-Streams style)")):
-    """
-    Generic passthrough — fetch ANY reanime.to / flixcloud.cc URL through the
-    relay proxies and return its payload. Mirrors Proxify-Streams' /proxy route:
-    response includes the `proxifiedSource` relay URLs that were used.
-    """
+async def proxy_passthrough(url: str = Query(..., description="Full reanime.to / flixcloud.cc URL to fetch through the smart fetch layer")):
     if not (url.startswith(BASE) or url.startswith(FLIX)):
         raise HTTPException(400, detail="Only reanime.to and flixcloud.cc URLs are allowed")
-    r, via = await _fetch_via_proxy(url, as_json=False)
+    accept_html = not url.startswith(f"{BASE}/api")
+    r, via = await _fetch_smart(url, accept_html=accept_html)
     try:
         payload = r.json()
     except Exception:
         payload = r.text[:2000]
     return {
-        "proxifiedSource": proxy_chain.all_proxified(url),
+        "proxifiedSource": [_relay_proxified_url(n, url) for n, _ in RELAY_SERVICES],
         "via": via,
         "data": payload,
     }
