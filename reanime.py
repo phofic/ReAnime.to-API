@@ -26,14 +26,12 @@ Env vars
 """
 
 import asyncio
-import json
 import os
 import re
 import random
 import time
 from contextlib import asynccontextmanager
 from urllib.parse import quote, urlencode
-from pathlib import Path
 from typing import Any, Callable, Optional
 
 import httpx
@@ -80,19 +78,20 @@ RELAY_COOLDOWN = float(os.getenv("RELAY_COOLDOWN", "60"))
 CACHE_ENABLED = os.getenv("CACHE_ENABLED", "1").strip() not in ("0", "false", "no")
 _PREMIUM_PROXY_URL = os.getenv("PROXY_URL", "").strip() or None
 
-# Free CORS/relay proxies. Each entry is (name, url_template, extra_headers,
-# json_only) where {url} in the template is the fully percent-encoded target.
-# `json_only` relays (e.g. Jina) mangle HTML into markdown, so they are only
-# used for JSON API requests, never for the flixcloud embed page.
+# Free CORS/relay proxies. Each entry is (name, url_template, json_headers,
+# html_headers) where {url} in the template is the fully percent-encoded
+# target. json_headers are sent for JSON API requests, html_headers for HTML
+# page fetches (e.g. the flixcloud embed) — Jina needs X-Return-Format to
+# switch between raw JSON and raw HTML. Other relays use default headers.
 # Override with PROXY_SERVICES env var: "name|template;name2|template2"
 DEFAULT_RELAY_SERVICES = [
-    # Jina Reader — fast (~1s) and currently the most reliable free relay
-    ("jina",       "https://r.jina.ai/{url}", {"X-Return-Format": "text"}, True),
-    ("allorigins", "https://api.allorigins.win/raw?url={url}", None, False),
-    ("corsproxy",  "https://corsproxy.io/?url={url}", None, False),
-    ("codetabs",   "https://api.codetabs.com/v1/proxy?quest={url}", None, False),
-    ("thingproxy", "https://thingproxy.freeboard.io/fetch/{url}", None, False),
-    ("corslol",    "https://api.cors.lol/?url={url}", None, False),
+    # Jina Reader — fast (~1-4s) and currently the most reliable free relay
+    ("jina",       "https://r.jina.ai/{url}", {"X-Return-Format": "text"}, {"X-Return-Format": "html"}),
+    ("allorigins", "https://api.allorigins.win/raw?url={url}", None, None),
+    ("corsproxy",  "https://corsproxy.io/?url={url}", None, None),
+    ("codetabs",   "https://api.codetabs.com/v1/proxy?quest={url}", None, None),
+    ("thingproxy", "https://thingproxy.freeboard.io/fetch/{url}", None, None),
+    ("corslol",    "https://api.cors.lol/?url={url}", None, None),
 ]
 
 
@@ -103,7 +102,7 @@ def _load_relay_services() -> list:
         for part in raw.split(";"):
             if "|" in part:
                 name, template = part.split("|", 1)
-                services.append((name.strip(), template.strip(), None, False))
+                services.append((name.strip(), template.strip(), None, None))
         if services:
             return services
     return list(DEFAULT_RELAY_SERVICES)
@@ -116,7 +115,7 @@ _relay_dead_until: dict[str, float] = {}
 _relay_lock = asyncio.Lock()
 
 
-_RELAY_INFO = {n: (t, h, j) for n, t, h, j in RELAY_SERVICES}
+_RELAY_INFO = {n: (t, hj, hh) for n, t, hj, hh in RELAY_SERVICES}
 
 
 def _relay_info(name: str) -> Optional[tuple]:
@@ -148,7 +147,7 @@ def relay_health() -> dict:
     now = time.monotonic()
     return {
         name: {"dead": _relay_dead_until.get(name, 0.0) > now, "template": tpl}
-        for name, tpl, _h, _j in RELAY_SERVICES
+        for name, tpl, _hj, _hh in RELAY_SERVICES
     }
 
 
@@ -257,8 +256,10 @@ async def _fetch_relay(name: str, url: str, *, params: dict = None,
         "User-Agent": random.choice(USER_AGENTS),
         "Accept": "application/json, text/plain, */*",
     }
-    if info and info[1]:  # relay-specific headers (e.g. Jina raw text)
-        headers.update(info[1])
+    # relay-specific headers (Jina: X-Return-Format text/json vs raw html)
+    extra = (info[2] if info else None) if not accept_html else (info[1] if info else None)
+    if extra:
+        headers.update(extra)
     if _PREMIUM_PROXY_URL:
         headers.pop("Origin", None)
     return await _client.get(relay_url, headers=headers, timeout=RELAY_TIMEOUT)
@@ -293,10 +294,7 @@ async def _relay_race(url: str, *, params: dict, accept_html: bool,
     exhausted: set[str] = set()  # relays that answered definitively this request
 
     while time.monotonic() < deadline:
-        candidate = [
-            n for n, _t, _h, jonly in RELAY_SERVICES
-            if (not jonly or not accept_html) and n not in exhausted
-        ]
+        candidate = [n for n, _t, _hj, _hh in RELAY_SERVICES if n not in exhausted]
         if not candidate:
             break
         alive = [n for n in candidate if not _is_relay_dead(n)]
@@ -403,33 +401,9 @@ async def _get_json_cached(key: str, ttl: float, url: str, params: dict = None) 
 
 
 # ---------------------------------------------------------------------------
-# Decryption (Node.js WASM pipeline)
+# Decryption (pure-Python WASM pipeline — no Node.js required)
 # ---------------------------------------------------------------------------
-_DECRYPT_MJS = str(Path(__file__).parent / "decrypt.mjs")
-
-
-async def _decrypt_embed(html: bytes) -> dict:
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "node", _DECRYPT_MJS, "-",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env={**os.environ},  # pass through FLIX_TOKEN_RELAY etc.
-        )
-    except FileNotFoundError:
-        raise HTTPException(503, detail="Node.js runtime not found — required for stream decryption")
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(input=html), timeout=25.0)
-    except asyncio.TimeoutError:
-        proc.kill()
-        raise HTTPException(504, detail="Decrypt subprocess timed out")
-    if proc.returncode != 0:
-        raise HTTPException(502, detail=f"Decrypt error: {stderr.decode()[:300]}")
-    try:
-        return json.loads(stdout)
-    except Exception:
-        raise HTTPException(502, detail="Decrypt produced invalid JSON")
+from decrypt import DecryptError, decrypt_stream, parse_embed  # noqa: E402
 
 
 async def get_stream_url(access_id: str, v: int = 2) -> dict:
@@ -441,7 +415,27 @@ async def get_stream_url(access_id: str, v: int = 2) -> dict:
                                  budget=min(RELAY_BUDGET, 6.0))
     if not r.content:
         raise HTTPException(502, detail="Empty embed page")
-    return await _decrypt_embed(r.content)
+
+    try:
+        parsed = parse_embed(r.content.decode("utf-8", errors="replace"))
+    except DecryptError as e:
+        raise HTTPException(502, detail=f"Embed parse failed: {e}")
+
+    # One-time token API — flixcloud also blocks datacenter IPs, so it goes
+    # through the same smart fetch chain (direct or relays).
+    token_url = f"{FLIX}/api/m3u8/{parsed['token']}"
+    try:
+        tok_r, _tv = await _fetch_smart(token_url)
+        token_data = tok_r.json()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, detail=f"Token API fetch failed: {e}")
+
+    try:
+        return decrypt_stream(parsed, token_data)
+    except DecryptError as e:
+        raise HTTPException(502, detail=f"Decrypt failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -650,7 +644,7 @@ async def proxy_passthrough(url: str = Query(..., description="Full reanime.to /
     except Exception:
         payload = r.text[:2000]
     return {
-        "proxifiedSource": [_relay_proxified_url(n, url) for n, _t, _h, _j in RELAY_SERVICES],
+        "proxifiedSource": [_relay_proxified_url(n, url) for n, _t, _hj, _hh in RELAY_SERVICES],
         "via": via,
         "data": payload,
     }
