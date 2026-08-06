@@ -40,6 +40,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
+
 BASE = "https://reanime.to"
 FLIX = "https://flixcloud.cc"
 
